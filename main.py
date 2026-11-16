@@ -1,26 +1,41 @@
-"""Entrypoint: render the Golden Koi Ramen scene to entry.png.
+"""Golden Koi Ramen -- entrypoint for make.fun ai-excited-01.
 
-Deterministic (pure stdlib, fixed hash noise): two runs produce a
-byte-identical PNG. Writes to $MAKEFUN_OUTPUT_DIR/entry.png when set,
-and always to ./entry.png next to this file.
+Renders the scene at 2048x2048 (supersampled), downsamples to
+1024x1024 for crisp anti-aliased edges, and writes entry.png.
+
+Writes to $MAKEFUN_OUTPUT_DIR/entry.png when set, else
+/output/entry.png when /output exists, else beside this file.
+Pure standard library only. Deterministic: two runs write identical
+bytes.
 """
 
 import os
+import time
 
 from render import Canvas
-from scene_koi import draw_scene
+from scene_koi import draw
+
+SUPER = 2048
+FINAL = 1024
 
 
 def main():
-    cv = Canvas(1024, 1024)
-    draw_scene(cv)
-    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "")
-    targets = ["entry.png"]
-    if out_dir:
-        targets.append(os.path.join(out_dir, "entry.png"))
-    for path in targets:
-        cv.save_png(path)
-        print("wrote", path)
+    t0 = time.time()
+    big = Canvas(SUPER, SUPER)
+    draw(big)
+    small = big.downsample()
+    assert small.w == FINAL and small.h == FINAL
+    data = small.png_bytes()
+    outdir = os.environ.get("MAKEFUN_OUTPUT_DIR")
+    if not outdir:
+        outdir = "/output" if os.path.isdir("/output") else \
+            os.path.dirname(os.path.abspath(__file__))
+    os.makedirs(outdir, exist_ok=True)
+    path = os.path.join(outdir, "entry.png")
+    with open(path, "wb") as f:
+        f.write(data)
+    print("wrote %s (%d bytes, %dx%d) in %.1fs"
+          % (path, len(data), FINAL, FINAL, time.time() - t0))
 
 
 if __name__ == "__main__":
