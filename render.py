@@ -1,58 +1,40 @@
-"""Pure-stdlib rasterizer for the Golden Koi Ramen entry.
+"""Pure-stdlib rasterizer: framebuffer, shapes, gradients, noise, PNG encoder.
 
-Bytearray RGB framebuffer, shapes, layered gradients, deterministic value
-noise, and a zlib PNG encoder. Standard library only — no PIL, no numpy,
-nothing the grader container lacks. Every output byte is deterministic:
-fixed constants + integer-hash noise + zlib at a fixed level.
+No third-party libraries: the grader runs in a fresh container with the
+standard library only. Everything is deterministic (fixed hash noise).
 """
 
 import math
+import os
 import struct
 import zlib
 
-W = 1024
-H = 1024
+W = H = 1024
 
 
-def clamp255(v):
-    v = int(v)
-    return 0 if v < 0 else (255 if v > 255 else v)
+def _clamp8(v):
+    if v < 0:
+        return 0
+    if v > 255:
+        return 255
+    return int(v)
 
 
-def mix(c1, c2, t):
-    """Linear interpolation between two (r, g, b) colors."""
-    return (c1[0] + (c2[0] - c1[0]) * t,
-            c1[1] + (c2[1] - c1[1]) * t,
-            c1[2] + (c2[2] - c1[2]) * t)
+def lerp(a, b, t):
+    return a + (b - a) * t
 
 
-def shade(color, f):
-    """Multiply a color's brightness by f."""
-    return (color[0] * f, color[1] * f, color[2] * f)
+def lerp_color(c0, c1, t):
+    return (lerp(c0[0], c1[0], t), lerp(c0[1], c1[1], t), lerp(c0[2], c1[2], t))
 
 
-def _hash2(x, y, seed):
-    """Deterministic integer hash -> float in [0, 1)."""
-    h = (x * 374761393 + y * 668265263 + seed * 974634211) & 0xFFFFFFFF
-    h ^= h >> 13
+def _hash_noise(x, y):
+    """Deterministic value noise in [0, 1)."""
+    h = (x * 374761393 + y * 668265263) & 0xFFFFFFFF
+    h = (h ^ (h >> 13)) & 0xFFFFFFFF
     h = (h * 1274126177) & 0xFFFFFFFF
-    h ^= h >> 16
-    return h / 4294967295.0
-
-
-def vnoise(x, y, seed=0):
-    """Smooth deterministic value noise in [0, 1)."""
-    xi = int(math.floor(x))
-    yi = int(math.floor(y))
-    xf = x - xi
-    yf = y - yi
-    u = xf * xf * (3 - 2 * xf)
-    v = yf * yf * (3 - 2 * yf)
-    a = _hash2(xi, yi, seed)
-    b = _hash2(xi + 1, yi, seed)
-    c = _hash2(xi, yi + 1, seed)
-    d = _hash2(xi + 1, yi + 1, seed)
-    return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v
+    h = (h ^ (h >> 16)) & 0xFFFFFFFF
+    return ((h >> 8) & 0xFFFF) / 65536.0
 
 
 class Canvas:
@@ -61,252 +43,288 @@ class Canvas:
         self.h = h
         self.px = bytearray(w * h * 3)
 
-    # -- core pixel op -------------------------------------------------
-    def put(self, x, y, color, alpha=1.0):
-        if 0 <= x < self.w and 0 <= y < self.h:
-            i = (y * self.w + x) * 3
-            px = self.px
-            if alpha >= 1.0:
-                px[i] = clamp255(color[0])
-                px[i + 1] = clamp255(color[1])
-                px[i + 2] = clamp255(color[2])
-            elif alpha > 0.0:
-                ia = 1.0 - alpha
-                px[i] = clamp255(px[i] * ia + color[0] * alpha)
-                px[i + 1] = clamp255(px[i + 1] * ia + color[1] * alpha)
-                px[i + 2] = clamp255(px[i + 2] * ia + color[2] * alpha)
-
-    def hspan(self, x0, x1, y, color, alpha=1.0):
+    # -- low-level ------------------------------------------------------
+    def _solid_row(self, y, x0, x1, r, g, b):
+        """Fill row span [x0, x1] with an opaque colour (C-speed slice)."""
         if y < 0 or y >= self.h:
             return
-        x0 = max(0, int(x0))
-        x1 = min(self.w - 1, int(x1))
+        if x0 < 0:
+            x0 = 0
+        if x1 >= self.w:
+            x1 = self.w - 1
+        if x1 < x0:
+            return
+        i = (y * self.w + x0) * 3
+        n = x1 - x0 + 1
+        self.px[i:i + n * 3] = bytes((r, g, b)) * n
+
+    def _blend_row(self, y, x0, x1, r, g, b, a):
+        """Blend row span [x0, x1] with colour at alpha a (0..1)."""
+        if y < 0 or y >= self.h or a <= 0:
+            return
+        if x0 < 0:
+            x0 = 0
+        if x1 >= self.w:
+            x1 = self.w - 1
         if x1 < x0:
             return
         px = self.px
-        w = self.w
-        r, g, b = color
-        if alpha >= 1.0:
-            ri, gi, bi = clamp255(r), clamp255(g), clamp255(b)
-            for x in range(x0, x1 + 1):
-                i = (y * w + x) * 3
-                px[i] = ri
-                px[i + 1] = gi
-                px[i + 2] = bi
-        else:
-            ia = 1.0 - alpha
-            for x in range(x0, x1 + 1):
-                i = (y * w + x) * 3
-                px[i] = clamp255(px[i] * ia + r * alpha)
-                px[i + 1] = clamp255(px[i + 1] * ia + g * alpha)
-                px[i + 2] = clamp255(px[i + 2] * ia + b * alpha)
+        ia = 1.0 - a
+        base = y * self.w * 3
+        for x in range(x0, x1 + 1):
+            i = base + x * 3
+            px[i] = int(r * a + px[i] * ia)
+            px[i + 1] = int(g * a + px[i + 1] * ia)
+            px[i + 2] = int(b * a + px[i + 2] * ia)
 
-    # -- fills ---------------------------------------------------------
-    def vgrad(self, top, bottom):
-        """Full-canvas vertical gradient."""
+    def blend_px(self, x, y, r, g, b, a):
+        if x < 0 or y < 0 or x >= self.w or y >= self.h or a <= 0:
+            return
         px = self.px
-        w, h = self.w, self.h
-        for y in range(h):
-            t = y / max(1, h - 1)
-            r = clamp255(top[0] + (bottom[0] - top[0]) * t)
-            g = clamp255(top[1] + (bottom[1] - top[1]) * t)
-            b = clamp255(top[2] + (bottom[2] - top[2]) * t)
-            base = y * w * 3
-            for x in range(w):
-                i = base + x * 3
-                px[i] = r
-                px[i + 1] = g
-                px[i + 2] = b
+        i = (y * self.w + x) * 3
+        ia = 1.0 - a
+        px[i] = int(r * a + px[i] * ia)
+        px[i + 1] = int(g * a + px[i + 1] * ia)
+        px[i + 2] = int(b * a + px[i + 2] * ia)
 
-    def radial_glow(self, cx, cy, radius, color, alpha):
-        """Soft radial light pool, alpha falling off as (1-d/r)^2."""
-        x0 = max(0, int(cx - radius))
-        x1 = min(self.w - 1, int(cx + radius))
-        y0 = max(0, int(cy - radius))
-        y1 = min(self.h - 1, int(cy + radius))
-        r2 = radius * radius
+    # -- fills ----------------------------------------------------------
+    def vgrad(self, y0, y1, c0, c1):
+        """Vertical gradient over the full width, rows y0..y1."""
+        if y0 < 0:
+            y0 = 0
+        if y1 >= self.h:
+            y1 = self.h - 1
+        span = max(1, y1 - y0)
+        for y in range(y0, y1 + 1):
+            c = lerp_color(c0, c1, (y - y0) / span)
+            self._solid_row(y, 0, self.w - 1, _clamp8(c[0]), _clamp8(c[1]), _clamp8(c[2]))
+
+    def disc(self, cx, cy, rad, color, alpha=1.0, feather=0):
+        """Filled circle. feather>0 softens the rim over that many px."""
+        if rad <= 0:
+            return
+        r, g, b = color
+        y0 = int(cy - rad - feather)
+        y1 = int(cy + rad + feather)
         for y in range(y0, y1 + 1):
             dy = y - cy
-            for x in range(x0, x1 + 1):
-                dx = x - cx
-                d2 = dx * dx + dy * dy
-                if d2 < r2:
-                    d = math.sqrt(d2) / radius
-                    a = alpha * (1.0 - d) * (1.0 - d)
-                    if a > 0.004:
-                        self.put(x, y, color, a)
-
-    def soft_ellipse(self, cx, cy, rx, ry, color, alpha):
-        """Ellipse whose alpha fades to zero at the rim (fake blur)."""
-        x0 = max(0, int(cx - rx))
-        x1 = min(self.w - 1, int(cx + rx))
-        y0 = max(0, int(cy - ry))
-        y1 = min(self.h - 1, int(cy + ry))
-        for y in range(y0, y1 + 1):
-            ny = (y - cy) / ry
-            for x in range(x0, x1 + 1):
-                nx = (x - cx) / rx
-                d2 = nx * nx + ny * ny
-                if d2 < 1.0:
-                    a = alpha * (1.0 - d2) * (1.0 - d2)
-                    if a > 0.004:
-                        self.put(x, y, color, a)
-
-    # -- shapes --------------------------------------------------------
-    def disc(self, cx, cy, r, color, alpha=1.0, soft=0):
-        """Filled circle; soft>0 feathers the edge over that many px."""
-        if r <= 0:
-            return
-        x0 = max(0, int(cx - r - soft))
-        x1 = min(self.w - 1, int(cx + r + soft))
-        y0 = max(0, int(cy - r - soft))
-        y1 = min(self.h - 1, int(cy + r + soft))
-        for y in range(y0, y1 + 1):
-            dy = (y - cy) / r
-            for x in range(x0, x1 + 1):
-                dx = (x - cx) / r
-                d = math.sqrt(dx * dx + dy * dy)
-                if d <= 1.0:
-                    a = alpha
-                elif soft > 0 and d <= 1.0 + soft / r:
-                    a = alpha * (1.0 - (d - 1.0) * r / soft)
-                else:
+            dd = rad * rad - dy * dy
+            if dd < 0:
+                if feather <= 0:
                     continue
-                if a > 0.004:
-                    self.put(x, y, color, a)
+                d = abs(dy) - rad
+                if d > feather:
+                    continue
+                a = alpha * (1.0 - d / feather) * 0.5
+                self._blend_row(y, int(cx - 1), int(cx + 1), r, g, b, a)
+                continue
+            half = math.sqrt(dd)
+            x0 = int(cx - half)
+            x1 = int(cx + half)
+            if alpha >= 0.999 and feather <= 0:
+                self._solid_row(y, x0, x1, _clamp8(r), _clamp8(g), _clamp8(b))
+            else:
+                self._blend_row(y, x0, x1, r, g, b, alpha)
+            if feather > 0:
+                fa = alpha * 0.45
+                self._blend_row(y, x0 - 1, x0, r, g, b, fa)
+                self._blend_row(y, x1, x1 + 1, r, g, b, fa)
 
-    def ellipse(self, cx, cy, rx, ry, color, alpha=1.0, soft=0):
+    def soft_disc(self, cx, cy, rad, color, alpha=1.0):
+        """Radial-gradient disc: alpha falls off quadratically to the rim."""
+        if rad <= 0:
+            return
+        r, g, b = color
+        y0 = max(0, int(cy - rad))
+        y1 = min(self.h - 1, int(cy + rad))
+        for y in range(y0, y1 + 1):
+            dy = y - cy
+            dd = rad * rad - dy * dy
+            if dd < 0:
+                continue
+            half = math.sqrt(dd)
+            x0 = int(cx - half)
+            x1 = int(cx + half)
+            px = self.px
+            base = y * self.w * 3
+            for x in range(max(0, x0), min(self.w - 1, x1) + 1):
+                dx = x - cx
+                d = math.sqrt(dx * dx + dy * dy) / rad
+                a = alpha * (1.0 - d) * (1.0 - d)
+                if a <= 0.003:
+                    continue
+                i = base + x * 3
+                ia = 1.0 - a
+                px[i] = int(r * a + px[i] * ia)
+                px[i + 1] = int(g * a + px[i + 1] * ia)
+                px[i + 2] = int(b * a + px[i + 2] * ia)
+
+    def ellipse(self, cx, cy, rx, ry, color, alpha=1.0, rot=0.0, feather=0):
+        """Filled ellipse, optionally rotated by rot radians."""
         if rx <= 0 or ry <= 0:
             return
-        x0 = max(0, int(cx - rx - soft))
-        x1 = min(self.w - 1, int(cx + rx + soft))
-        y0 = max(0, int(cy - ry - soft))
-        y1 = min(self.h - 1, int(cy + ry + soft))
+        r, g, b = color
+        u = math.cos(rot)
+        v = math.sin(rot)
+        bx = math.sqrt((rx * u) ** 2 + (ry * v) ** 2)
+        by = math.sqrt((rx * v) ** 2 + (ry * u) ** 2)
+        y0 = int(cy - by - feather)
+        y1 = int(cy + by + feather)
         for y in range(y0, y1 + 1):
-            ny = (y - cy) / ry
-            for x in range(x0, x1 + 1):
-                nx = (x - cx) / rx
-                d = math.sqrt(nx * nx + ny * ny)
-                if d <= 1.0:
-                    a = alpha
-                elif soft > 0 and d <= 1.0 + soft / max(rx, ry):
-                    a = alpha * (1.0 - (d - 1.0) * max(rx, ry) / soft)
-                else:
-                    continue
-                if a > 0.004:
-                    self.put(x, y, color, a)
+            dy = y - cy
+            # (qx/rx)^2 + (qy/ry)^2 <= 1 with qx = u*dx + v*dy, qy = -v*dx + u*dy
+            a2 = (u / rx) ** 2 + (v / ry) ** 2
+            b2 = 2.0 * dy * (u * v / (rx * rx) - u * v / (ry * ry))
+            c2 = (dy * dy) * ((v / rx) ** 2 + (u / ry) ** 2) - 1.0
+            disc = b2 * b2 - 4.0 * a2 * c2
+            if disc < 0:
+                continue
+            sq = math.sqrt(disc)
+            x0 = int(cx + (-b2 - sq) / (2.0 * a2))
+            x1 = int(cx + (-b2 + sq) / (2.0 * a2))
+            if alpha >= 0.999 and feather <= 0:
+                self._solid_row(y, x0, x1, _clamp8(r), _clamp8(g), _clamp8(b))
+            else:
+                self._blend_row(y, x0, x1, r, g, b, alpha)
 
-    def poly(self, points, color, alpha=1.0):
-        """Scanline-filled polygon (even-odd)."""
-        if len(points) < 3:
+    def ellipse_ring(self, cx, cy, rx, ry, thick, color, alpha=1.0, rot=0.0,
+                     a0=None, a1=None):
+        """Ellipse outline (optionally a partial arc from a0 to a1 radians)."""
+        if rx <= 0 or ry <= 0:
             return
-        ys = [p[1] for p in points]
-        y0 = max(0, int(min(ys)))
-        y1 = min(self.h - 1, int(max(ys)))
-        n = len(points)
+        if a0 is None:
+            a0, a1 = 0.0, 2.0 * math.pi
+        span = a1 - a0
+        steps = max(8, int(span * max(rx, ry) / 3.0))
+        dot = max(1.5, thick * 0.5)
+        for s in range(steps + 1):
+            t = a0 + span * s / steps
+            x = cx + rx * math.cos(t)
+            y = cy + ry * math.sin(t)
+            if rot:
+                dx = x - cx
+                dy = y - cy
+                x = cx + dx * math.cos(rot) - dy * math.sin(rot)
+                y = cy + dx * math.sin(rot) + dy * math.cos(rot)
+            self.disc(x, y, dot, color, alpha)
+
+    # -- strokes --------------------------------------------------------
+    def capsule(self, x1, y1, x2, y2, rad, color, alpha=1.0):
+        """Thick line segment (round caps)."""
+        if rad <= 0:
+            return
+        r, g, b = color
+        dx = x2 - x1
+        dy = y2 - y1
+        seg2 = dx * dx + dy * dy
+        x0 = int(min(x1, x2) - rad - 1)
+        x1b = int(max(x1, x2) + rad + 1)
+        y0 = int(min(y1, y2) - rad - 1)
+        y1b = int(max(y1, y2) + rad + 1)
+        px = self.px
+        for y in range(max(0, y0), min(self.h - 1, y1b) + 1):
+            base = y * self.w * 3
+            for x in range(max(0, x0), min(self.w - 1, x1b) + 1):
+                if seg2 == 0:
+                    t = 0.0
+                else:
+                    t = ((x - x1) * dx + (y - y1) * dy) / seg2
+                    t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+                px_ = x1 + t * dx
+                py_ = y1 + t * dy
+                d2 = (x - px_) ** 2 + (y - py_) ** 2
+                if d2 > rad * rad:
+                    continue
+                i = base + x * 3
+                ia = 1.0 - alpha
+                px[i] = int(r * alpha + px[i] * ia)
+                px[i + 1] = int(g * alpha + px[i + 1] * ia)
+                px[i + 2] = int(b * alpha + px[i + 2] * ia)
+
+    def poly(self, pts, color, alpha=1.0):
+        """Filled polygon (scanline, even-odd)."""
+        if len(pts) < 3:
+            return
+        r, g, b = color
+        ys = [p[1] for p in pts]
+        y0 = int(max(0, min(ys)))
+        y1 = int(min(self.h - 1, max(ys)))
+        n = len(pts)
         for y in range(y0, y1 + 1):
             xs = []
             for i in range(n):
-                x0, y0p = points[i]
-                x1, y1p = points[(i + 1) % n]
-                if (y0p <= y < y1p) or (y1p <= y < y0p):
-                    t = (y - y0p) / (y1p - y0p)
-                    xs.append(x0 + t * (x1 - x0))
+                x1, y1p = pts[i]
+                x2, y2p = pts[(i + 1) % n]
+                if (y1p <= y < y2p) or (y2p <= y < y1p):
+                    t = (y - y1p) / (y2p - y1p)
+                    xs.append(x1 + t * (x2 - x1))
             xs.sort()
-            for i in range(0, len(xs) - 1, 2):
-                self.hspan(xs[i], xs[i + 1], y, color, alpha)
+            for k in range(0, len(xs) - 1, 2):
+                xa = int(xs[k])
+                xb = int(xs[k + 1])
+                if alpha >= 0.999:
+                    self._solid_row(y, xa, xb, _clamp8(r), _clamp8(g), _clamp8(b))
+                else:
+                    self._blend_row(y, xa, xb, r, g, b, alpha)
 
-    def line(self, x0, y0, x1, y1, width, color, alpha=1.0):
-        """Thick line drawn as a chain of discs."""
-        dx = x1 - x0
-        dy = y1 - y0
-        length = math.hypot(dx, dy)
-        steps = max(2, int(length / max(1.0, width * 0.35)) + 1)
-        r = width / 2.0
-        for i in range(steps + 1):
-            t = i / steps
-            self.disc(x0 + dx * t, y0 + dy * t, r, color, alpha)
+    def arc(self, cx, cy, rad, a0, a1, color, alpha=1.0, thick=3.0):
+        """Circular arc stroke from angle a0 to a1 (radians, screen coords)."""
+        span = a1 - a0
+        steps = max(4, int(abs(span) * rad / 3.0))
+        dot = max(1.2, thick * 0.5)
+        for s in range(steps + 1):
+            t = a0 + span * s / steps
+            self.disc(cx + rad * math.cos(t), cy + rad * math.sin(t),
+                      dot, color, alpha)
 
-    def bezier(self, p0, p1, p2, p3, width, color, alpha=1.0):
-        """Thick cubic bezier drawn as a chain of discs."""
-        approx = (math.hypot(p1[0] - p0[0], p1[1] - p0[1]) +
-                  math.hypot(p2[0] - p1[0], p2[1] - p1[1]) +
-                  math.hypot(p3[0] - p2[0], p3[1] - p2[1]))
-        steps = max(4, int(approx / max(1.0, width * 0.35)) + 1)
-        r = width / 2.0
-        for i in range(steps + 1):
-            t = i / steps
+    # -- curves ---------------------------------------------------------
+    @staticmethod
+    def bezier(p0, p1, p2, p3, n=40):
+        """Cubic bezier sample points."""
+        pts = []
+        for i in range(n + 1):
+            t = i / n
             mt = 1.0 - t
-            x = (mt ** 3 * p0[0] + 3 * mt * mt * t * p1[0] +
-                 3 * mt * t * t * p2[0] + t ** 3 * p3[0])
-            y = (mt ** 3 * p0[1] + 3 * mt * mt * t * p1[1] +
-                 3 * mt * t * t * p2[1] + t ** 3 * p3[1])
-            self.disc(x, y, r, color, alpha)
+            x = (mt ** 3 * p0[0] + 3 * mt * mt * t * p1[0]
+                 + 3 * mt * t * t * p2[0] + t ** 3 * p3[0])
+            y = (mt ** 3 * p0[1] + 3 * mt * mt * t * p1[1]
+                 + 3 * mt * t * t * p2[1] + t ** 3 * p3[1])
+            pts.append((x, y))
+        return pts
 
-    def ring(self, cx, cy, r, width, color, alpha=1.0):
-        """Circle outline, drawn as small discs around the circumference."""
-        steps = max(24, int(2 * math.pi * r / max(2.0, width * 0.6)))
-        for i in range(steps):
-            a = 2 * math.pi * i / steps
-            self.disc(cx + r * math.cos(a), cy + r * math.sin(a),
-                      width / 2.0, color, alpha)
+    @staticmethod
+    def bezier_tangent(p0, p1, p2, p3, t):
+        """Unit tangent of a cubic bezier at parameter t."""
+        mt = 1.0 - t
+        dx = (3 * mt * mt * (p1[0] - p0[0])
+              + 6 * mt * t * (p2[0] - p1[0])
+              + 3 * t * t * (p3[0] - p2[0]))
+        dy = (3 * mt * mt * (p1[1] - p0[1])
+              + 6 * mt * t * (p2[1] - p1[1])
+              + 3 * t * t * (p3[1] - p2[1]))
+        ln = math.hypot(dx, dy) or 1.0
+        return (dx / ln, dy / ln)
 
-    def ellipse_ring(self, cx, cy, rx, ry, width, color, alpha=1.0):
-        steps = max(48, int(2 * math.pi * max(rx, ry) / max(2.0, width * 0.6)))
-        for i in range(steps):
-            a = 2 * math.pi * i / steps
-            self.disc(cx + rx * math.cos(a), cy + ry * math.sin(a),
-                      width / 2.0, color, alpha)
+    # -- texture --------------------------------------------------------
+    def grain(self, x0, y0, x1, y1, amount=14):
+        """Deterministic speckle inside a rectangle (adds realism)."""
+        for y in range(max(0, y0), min(self.h, y1)):
+            base = y * self.w * 3
+            for x in range(max(0, x0), min(self.w, x1)):
+                n = (_hash_noise(x, y) - 0.5) * 2.0 * amount
+                i = base + x * 3
+                self.px[i] = _clamp8(self.px[i] + n)
+                self.px[i + 1] = _clamp8(self.px[i + 1] + n)
+                self.px[i + 2] = _clamp8(self.px[i + 2] + n)
 
-    def star4(self, cx, cy, r, color, alpha=1.0):
-        """Small four-point sparkle (two crossed thin lines)."""
-        self.line(cx - r, cy, cx + r, cy, 2.2, color, alpha)
-        self.line(cx, cy - r, cx, cy + r, 2.2, color, alpha)
-        self.disc(cx, cy, 2.0, color, alpha)
-
-    # -- texture -------------------------------------------------------
-    def grain_region(self, x0, y0, x1, y1, scale, amp, seed=0):
-        """Per-pixel brightness modulation from deterministic noise."""
-        x0 = max(0, int(x0))
-        y0 = max(0, int(y0))
-        x1 = min(self.w - 1, int(x1))
-        y1 = min(self.h - 1, int(y1))
-        px = self.px
-        w = self.w
-        for y in range(y0, y1 + 1):
-            for x in range(x0, x1 + 1):
-                n = vnoise(x / scale, y / scale, seed)
-                f = 1.0 + (n - 0.5) * 2.0 * amp
-                i = (y * w + x) * 3
-                px[i] = clamp255(px[i] * f)
-                px[i + 1] = clamp255(px[i + 1] * f)
-                px[i + 2] = clamp255(px[i + 2] * f)
-
-    def vignette(self, strength=0.30):
-        """Darken corners; strength 0..1."""
-        cx, cy = self.w / 2.0, self.h / 2.0
-        maxd = math.hypot(cx, cy)
-        px = self.px
-        w, h = self.w, self.h
-        for y in range(h):
-            for x in range(w):
-                d = math.hypot(x - cx, y - cy) / maxd
-                f = 1.0 - strength * (d * d * d)
-                if f < 1.0:
-                    i = (y * w + x) * 3
-                    px[i] = clamp255(px[i] * f)
-                    px[i + 1] = clamp255(px[i + 1] * f)
-                    px[i + 2] = clamp255(px[i + 2] * f)
-
-    # -- output --------------------------------------------------------
-    def to_png_bytes(self):
-        """Encode as PNG (filter 0, zlib level 6). Deterministic."""
-        w, h = self.w, self.h
+    # -- output ---------------------------------------------------------
+    def save_png(self, path):
+        """Write the framebuffer as a PNG (filter 0, zlib level 6)."""
         raw = bytearray()
-        px = self.px
-        for y in range(h):
+        stride = self.w * 3
+        for y in range(self.h):
             raw.append(0)
-            raw += px[y * w * 3:(y + 1) * w * 3]
+            raw += self.px[y * stride:(y + 1) * stride]
         comp = zlib.compress(bytes(raw), 6)
 
         def chunk(ctype, data):
@@ -314,6 +332,11 @@ class Canvas:
             c += struct.pack(">I", zlib.crc32(ctype + data) & 0xFFFFFFFF)
             return c
 
-        ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
-        return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) +
-                chunk(b"IDAT", comp) + chunk(b"IEND", b""))
+        ihdr = struct.pack(">IIBBBBB", self.w, self.h, 8, 2, 0, 0, 0)
+        png = b"\x89PNG\r\n\x1a\n"
+        png += chunk(b"IHDR", ihdr)
+        png += chunk(b"IDAT", comp)
+        png += chunk(b"IEND", b"")
+        with open(path, "wb") as f:
+            f.write(png)
+        return path

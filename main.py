@@ -1,27 +1,26 @@
-"""Entrypoint: render the Golden Koi Ramen scene deterministically.
+"""Entrypoint: render the Golden Koi Ramen scene to entry.png.
 
-Writes entry.png next to this file and to $MAKEFUN_OUTPUT_DIR (default
-/output) — the bytes are identical in both places, and two runs produce
-byte-identical PNGs. Standard library only.
+Deterministic (pure stdlib, fixed hash noise): two runs produce a
+byte-identical PNG. Writes to $MAKEFUN_OUTPUT_DIR/entry.png when set,
+and always to ./entry.png next to this file.
 """
 
 import os
 
-from scene_koi import render_scene
+from render import Canvas
+from scene_koi import draw_scene
 
 
 def main():
-    png = render_scene()
-    here = os.path.dirname(os.path.abspath(__file__))
-    with open(os.path.join(here, "entry.png"), "wb") as f:
-        f.write(png)
-    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-    try:
-        os.makedirs(out_dir, exist_ok=True)
-        with open(os.path.join(out_dir, "entry.png"), "wb") as f:
-            f.write(png)
-    except OSError:
-        pass
+    cv = Canvas(1024, 1024)
+    draw_scene(cv)
+    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "")
+    targets = ["entry.png"]
+    if out_dir:
+        targets.append(os.path.join(out_dir, "entry.png"))
+    for path in targets:
+        cv.save_png(path)
+        print("wrote", path)
 
 
 if __name__ == "__main__":
