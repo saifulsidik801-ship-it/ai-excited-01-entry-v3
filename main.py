@@ -1,31 +1,27 @@
-"""ai-excited-01 entry: GOLDEN KOI RAMEN.
+"""Entrypoint: render the Golden Koi Ramen scene deterministically.
 
-A giant golden koi bursting out of a ramen bowl on a wooden table —
-broth splashing in arcs, chopsticks flying, steam curling, warm
-restaurant light. Pure standard library: the program draws the image
-pixel by pixel with the rasterizer in render.py and the scene in
-scene_koi.py, then writes it to /output/entry.png (or
-$MAKEFUN_OUTPUT_DIR/entry.png when set).
-
-Deterministic: fixed seeds, fixed compression level, no timestamps.
-Run it twice and the PNG bytes are identical.
+Writes entry.png next to this file and to $MAKEFUN_OUTPUT_DIR (default
+/output) — the bytes are identical in both places, and two runs produce
+byte-identical PNGs. Standard library only.
 """
 
 import os
-import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from render import Canvas, output_path
-import scene_koi
+from scene_koi import render_scene
 
 
 def main():
-    canvas = Canvas()
-    scene_koi.draw(canvas)
-    path = output_path("entry.png")
-    canvas.save(path)
-    print("wrote", path)
+    png = render_scene()
+    here = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(here, "entry.png"), "wb") as f:
+        f.write(png)
+    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        with open(os.path.join(out_dir, "entry.png"), "wb") as f:
+            f.write(png)
+    except OSError:
+        pass
 
 
 if __name__ == "__main__":

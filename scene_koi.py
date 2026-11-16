@@ -1,205 +1,397 @@
-"""Scene 1 — GOLDEN KOI RAMEN.
+"""Golden Koi Ramen — realistic rendering of the winning scene.
 
-A giant golden koi bursting out of a ramen bowl on a wooden table:
-broth splashing in arcs, chopsticks flying, steam curling, warm
-restaurant light, chili-oil reds against koi gold.
+A giant golden koi bursting diagonally out of a ramen bowl: broth splash
+plumes, flying chopsticks, steam, warm bokeh restaurant light. 1024x1024.
 
-Draws onto a render.Canvas. Pure standard library.
+Same composition as the reference image; the realism comes from shading:
+layered gradients instead of flat fills, specular highlights, scale rows,
+translucent fins, wood grain, broth texture, soft shadows, bokeh depth.
+Pure stdlib; rendered by render.py.
 """
 
 import math
 
-from render import Canvas
+from render import Canvas, mix, shade, vnoise
+
+# -- palette ------------------------------------------------------------
+BG_TOP = (34, 17, 4)
+BG_BOT = (74, 36, 8)
+GLOW = (138, 74, 18)
+TABLE = (72, 42, 16)
+TABLE_DARK = (42, 22, 7)
+BOWL_RED = (156, 22, 8)
+BOWL_RED_LT = (192, 40, 16)
+BOWL_RIM = (232, 104, 48)
+BROTH = (192, 90, 16)
+BROTH_LT = (232, 130, 26)
+BROTH_HI = (248, 176, 80)
+KOI_DEEP = (206, 82, 8)
+KOI_MID = (240, 140, 24)
+KOI_LT = (245, 158, 32)
+KOI_GOLD = (248, 176, 48)
+BELLY = (251, 238, 200)
+FIN = (224, 112, 8)
+WHITE = (255, 250, 240)
 
 
-def _radius_profile(t):
-    """Koi body radius along the spine: thin tail, fat belly, round head."""
-    keys = [(0.00, 26), (0.15, 68), (0.45, 102), (0.65, 94),
-            (0.85, 74), (1.00, 58)]
-    for i in range(len(keys) - 1):
-        t0, r0 = keys[i]
-        t1, r1 = keys[i + 1]
+# -- helpers ------------------------------------------------------------
+def _catmull(points, per_seg=22):
+    """Catmull-Rom spline through points -> dense sample list."""
+    pts = [points[0]] + list(points) + [points[-1]]
+    out = []
+    for i in range(len(pts) - 3):
+        p0, p1, p2, p3 = pts[i], pts[i + 1], pts[i + 2], pts[i + 3]
+        for j in range(per_seg):
+            t = j / per_seg
+            t2, t3 = t * t, t * t * t
+            x = 0.5 * ((2 * p1[0]) + (-p0[0] + p2[0]) * t +
+                       (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 +
+                       (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3)
+            y = 0.5 * ((2 * p1[1]) + (-p0[1] + p2[1]) * t +
+                       (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 +
+                       (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3)
+            out.append((x, y))
+    out.append(points[-1])
+    return out
+
+
+def _profile(t, stops):
+    """Piecewise-linear interpolation over (t, value) stops."""
+    if t <= stops[0][0]:
+        return stops[0][1]
+    if t >= stops[-1][0]:
+        return stops[-1][1]
+    for i in range(len(stops) - 1):
+        t0, v0 = stops[i]
+        t1, v1 = stops[i + 1]
         if t0 <= t <= t1:
             f = (t - t0) / (t1 - t0)
-            return r0 + (r1 - r0) * f
-    return keys[-1][1]
+            if isinstance(v0, tuple):
+                return mix(v0, v1, f)
+            return v0 + (v1 - v0) * f
+    return stops[-1][1]
 
 
-def draw(c):
-    W, H = c.w, c.h
+def _wavy_hline(c, ybase, x0, x1, step, amp, scale, seed, width, color, alpha):
+    """Horizontal line whose y wobbles with deterministic noise."""
+    xs = list(range(int(x0), int(x1) + 1, step))
+    pts = [(x, ybase + (vnoise(x / scale, seed, seed) - 0.5) * amp)
+           for x in xs]
+    for a, b in zip(pts, pts[1:]):
+        c.line(a[0], a[1], b[0], b[1], width, color, alpha)
 
-    # -- warm restaurant background ------------------------------------
-    c.vgrad((46, 26, 12), (122, 60, 20))
-    c.glow(560, 380, 520, (255, 170, 60), 0.50)
-    c.glow(180, 160, 200, (255, 120, 40), 0.35)
-    c.glow(880, 140, 170, (255, 90, 30), 0.30)
-    # bokeh lanterns
-    for (x, y, r, col, a) in [
-            (150, 150, 46, (255, 150, 60), 0.55),
-            (880, 130, 36, (255, 110, 50), 0.55),
-            (90, 430, 30, (255, 140, 70), 0.45),
-            (935, 470, 40, (255, 120, 45), 0.45),
-            (820, 60, 18, (255, 180, 90), 0.6),
-            (240, 60, 14, (255, 160, 80), 0.6)]:
-        c.circle(x, y, r, col, a)
-        c.circle(x, y, int(r * 0.45), (255, 210, 130), a * 0.8)
 
-    # -- wooden table ---------------------------------------------------
-    c.poly([(0, 760), (W, 760), (W, H), (0, H)], (107, 66, 38))
-    for y in (832, 906, 978):
-        c.line(0, y, W, y, 5, (74, 44, 23), 0.9)
-    # grain strokes
-    c.curve((60, 800), (300, 812), (600, 798), (980, 820), 3,
-            (90, 54, 30), 0.7)
-    c.curve((40, 880), (350, 868), (700, 884), (1000, 872), 3,
-            (90, 54, 30), 0.6)
-    c.curve((80, 950), (400, 962), (750, 948), (1010, 962), 3,
-            (82, 48, 26), 0.6)
-    # soft shadow under the bowl
-    c.ellipse(512, 905, 330, 42, (40, 20, 8), 0.35)
+# -- scene passes -------------------------------------------------------
+def _background(c):
+    c.vgrad(BG_TOP, BG_BOT)
+    c.radial_glow(560, 420, 520, GLOW, 0.50)
+    c.radial_glow(300, 200, 260, (120, 60, 14), 0.35)
+    # warm bokeh: soft discs, varying size and brightness
+    bokeh = [
+        (150, 150, 46, (255, 150, 48), 0.28, 14),
+        (880, 130, 34, (232, 96, 32), 0.35, 12),
+        (905, 470, 42, (255, 140, 40), 0.22, 16),
+        (95, 430, 30, (220, 110, 30), 0.25, 12),
+        (830, 60, 22, (255, 180, 90), 0.30, 8),
+        (250, 60, 18, (255, 170, 80), 0.28, 8),
+        (640, 90, 26, (240, 120, 40), 0.22, 10),
+        (60, 700, 24, (200, 100, 26), 0.18, 10),
+        (960, 700, 20, (230, 120, 40), 0.20, 8),
+        (700, 480, 16, (255, 160, 70), 0.25, 8),
+    ]
+    for x, y, r, col, a, soft in bokeh:
+        c.disc(x, y, r, col, a, soft=soft)
+    # bright cores inside a few bokeh discs
+    c.disc(150, 150, 14, (255, 190, 110), 0.50, soft=6)
+    c.disc(880, 130, 11, (255, 170, 100), 0.45, soft=5)
+    c.disc(250, 60, 8, (255, 200, 130), 0.45, soft=4)
+    c.grain_region(0, 0, 1024, 800, 7.0, 0.05, seed=3)
 
-    # -- ramen bowl ------------------------------------------------------
-    # outer lacquer body
-    c.ellipse(512, 806, 300, 88, (138, 31, 18), 1.0, feather=2)
-    # bowl wall: a crescent of lighter lacquer below the broth
-    c.ellipse(512, 824, 282, 66, (168, 40, 26), 1.0)
-    # foot ring
-    c.ellipse(512, 888, 118, 16, (90, 18, 10), 1.0)
-    # gold rim (ellipse band, follows the bowl)
-    c.ellipse_ring(512, 800, 292, 76, 6, (232, 176, 84), 0.95)
-    # broth
-    c.ellipse(512, 798, 262, 60, (193, 68, 14), 1.0)
-    c.ellipse(512, 792, 200, 44, (224, 106, 31), 1.0)
-    # chili-oil swirls
-    c.ellipse(430, 792, 46, 12, (138, 31, 10), 0.85)
-    c.ellipse(610, 800, 52, 13, (138, 31, 10), 0.85)
-    c.ellipse(520, 786, 30, 8, (160, 40, 12), 0.8)
-    # noodle waves
-    for (y0, amp, x0) in [(786, 7, 330), (798, 8, 360), (808, 6, 340),
-                          (792, 7, 560), (804, 8, 590)]:
-        c.curve((x0, y0), (x0 + 60, y0 - amp), (x0 + 130, y0 + amp),
-                (x0 + 190, y0), 7, (242, 211, 138), 0.95)
-    # narutomaki
-    c.circle(400, 800, 26, (250, 246, 236), 1.0)
-    c.ring(400, 800, 20, 5, (232, 120, 140), 1.0)
-    c.circle(400, 800, 7, (232, 120, 140), 1.0)
-    # soft egg
-    c.ellipse(624, 802, 34, 22, (250, 238, 210), 1.0)
-    c.circle(624, 802, 11, (245, 166, 38), 1.0)
+
+def _table(c):
+    c.poly([(0, 800), (1024, 800), (1024, 1024), (0, 1024)], TABLE)
+    c.line(0, 800, 1024, 800, 3, (106, 58, 24), 0.6)
+    # plank separations, gently wavy
+    for ybase, seed in ((858, 21), (918, 22), (978, 23)):
+        _wavy_hline(c, ybase, 0, 1024, 64, 7, 90, seed, 3, TABLE_DARK, 0.40)
+    # wood grain: thin wavy darker lines
+    for k in range(14):
+        ybase = 812 + k * 15 + int((vnoise(k * 3.7, 0, 31) - 0.5) * 8)
+        _wavy_hline(c, ybase, 0, 1024, 32, 6, 140, 40 + k, 2.5,
+                    shade(TABLE, 0.55), 0.25)
+    c.grain_region(0, 800, 1024, 1024, 5.0, 0.06, seed=5)
+
+
+def _bowl(c):
+    # soft drop shadow on the table
+    c.soft_ellipse(512, 905, 335, 52, (16, 8, 2), 0.55)
+    c.soft_ellipse(512, 898, 300, 40, (24, 12, 4), 0.50)
+    # ceramic body: red with a lighter upper glaze and dark base curve
+    c.ellipse(512, 828, 305, 92, BOWL_RED)
+    c.ellipse(512, 818, 300, 82, BOWL_RED_LT, 0.55)
+    c.soft_ellipse(512, 862, 290, 52, (90, 10, 4), 0.50)
+    # gold-red rim + glaze specular streak along the front rim
+    c.ellipse_ring(512, 826, 303, 90, 7, BOWL_RIM, 0.85)
+    c.bezier((280, 880), (400, 908), (620, 908), (740, 878),
+             6, (248, 160, 96), 0.55)
+    c.bezier((330, 892), (430, 912), (580, 912), (690, 888),
+             3, (255, 200, 140), 0.35)
+    # pale broth pools spilled on the table beside the bowl
+    c.ellipse(298, 868, 58, 13, (240, 210, 160), 0.55)
+    c.ellipse(726, 864, 52, 12, (240, 210, 160), 0.55)
+
+
+def _broth(c):
+    c.ellipse(512, 822, 272, 76, BROTH)
+    c.radial_glow(480, 798, 200, BROTH_LT, 0.70)
+    c.radial_glow(560, 845, 150, (160, 70, 10), 0.40)
+    c.bezier((330, 790), (450, 772), (600, 788), (700, 778),
+             5, BROTH_HI, 0.45)
+    c.ellipse_ring(512, 822, 268, 73, 4, (120, 50, 8), 0.50)
+    # oil sheen swirls on the surface
+    c.bezier((360, 800), (480, 780), (600, 810), (700, 795),
+             5, BROTH_HI, 0.30)
+    c.bezier((380, 840), (500, 825), (600, 848), (690, 832),
+             4, BROTH_HI, 0.25)
+    c.bezier((420, 790), (520, 775), (600, 792), (660, 782),
+             3, (255, 200, 110), 0.30)
+    # fine broth texture
+    c.grain_region(250, 750, 775, 900, 4.0, 0.07, seed=7)
     # green onion rings
-    for (x, y) in [(350, 788), (470, 812), (560, 786), (680, 812),
-                   (440, 780), (590, 816)]:
-        c.ring(x, y, 9, 4, (90, 143, 60), 1.0)
-        c.circle(x, y, 3, (120, 180, 80), 1.0)
+    for x, y, r in ((430, 815, 10), (600, 845, 9), (380, 845, 8),
+                    (660, 810, 9), (520, 850, 8), (350, 800, 7)):
+        c.ring(x, y, r, 3.5, (58, 122, 32), 0.9)
+        c.disc(x, y, 2.5, (90, 160, 50), 0.8)
+    # halved egg, right side
+    c.ellipse(648, 838, 44, 17, (250, 244, 225))
+    c.disc(648, 838, 13, (248, 184, 48))
+    c.disc(644, 834, 4, WHITE, 0.8)
+    # noodle strands, short and wavy
+    c.bezier((330, 828), (420, 818), (500, 836), (580, 824),
+             4, (240, 208, 144), 0.75)
+    c.bezier((560, 842), (620, 832), (670, 848), (710, 838),
+             3.5, (240, 208, 144), 0.6)
+    c.bezier((300, 846), (380, 838), (440, 852), (500, 844),
+             3.5, (240, 208, 144), 0.55)
 
-    # -- koi spine --------------------------------------------------------
-    spine = c.bezier((430, 775), (360, 520), (545, 360), (665, 250), 26)
-    radii = [_radius_profile(i / 26) for i in range(27)]
 
-    # tail fins first (body overlaps their roots): curved fan lobes
-    # sweeping sideways along the broth surface
-    t1 = c.bezier((430, 775), (370, 790), (320, 810), (300, 835), 12)
-    t2 = c.bezier((300, 835), (340, 855), (400, 845), (434, 812), 12)
-    c.poly(t1 + t2[1:], (250, 175, 80), 0.8)
-    t3 = c.bezier((430, 775), (490, 790), (540, 810), (560, 835), 12)
-    t4 = c.bezier((560, 835), (520, 855), (460, 845), (426, 812), 12)
-    c.poly(t3 + t4[1:], (250, 175, 80), 0.8)
-    c.curve((430, 775), (380, 800), (340, 820), (306, 834), 3,
-            (230, 140, 40), 0.8)
-    c.curve((430, 775), (480, 800), (520, 820), (554, 834), 3,
-            (230, 140, 40), 0.8)
+def _steam(c):
+    # soft wavy wisps rising above the bowl, behind the koi
+    c.bezier((385, 770), (360, 690), (405, 610), (375, 525),
+             13, WHITE, 0.07)
+    c.bezier((585, 760), (610, 675), (570, 595), (602, 515),
+             14, WHITE, 0.08)
+    c.bezier((690, 755), (672, 685), (702, 615), (680, 550),
+             11, WHITE, 0.06)
+    c.bezier((405, 760), (388, 685), (412, 615), (392, 545),
+             8, WHITE, 0.05)
+    c.bezier((600, 750), (618, 675), (588, 605), (614, 535),
+             8, WHITE, 0.06)
 
-    # body: orange tube
-    c.tube(spine, radii, (240, 138, 29), 1.0)
-    # belly: cream tube offset down-right, slimmer
-    belly = [(x + 16, y + 24) for (x, y) in spine]
-    bradii = [r * 0.60 for r in radii]
-    c.tube(belly, bradii, (255, 243, 214), 1.0)
-    # top sheen: pale gold along the upper edge
-    sheen = [(x - 12, y - 16) for (x, y) in spine]
-    sradii = [r * 0.34 for r in radii]
-    c.tube(sheen, sradii, (255, 196, 107), 0.85)
-    # scales: darker rings along the upper side of the body
-    for i in range(2, 25, 3):
-        x, y = spine[i]
-        c.ring(int(x) - 8, int(y) - 14, 10, 3, (217, 111, 14), 0.5)
-    for i in range(3, 25, 4):
-        x, y = spine[i]
-        c.circle(int(x), int(y) - 20, 4, (217, 111, 14), 0.55)
 
-    # dorsal fin: curved leaf hugging the orange back (not the belly seam)
-    d1 = c.bezier((470, 480), (440, 400), (460, 350), (510, 340), 14)
-    d2 = c.bezier((510, 340), (525, 410), (515, 470), (500, 520), 12)
-    c.poly(d1 + d2[1:], (235, 145, 45), 0.95)
-    # pectoral fin: curved leaf sweeping back-down from the belly
-    p1 = c.bezier((530, 570), (470, 620), (430, 670), (415, 700), 12)
-    p2 = c.bezier((415, 700), (470, 690), (520, 650), (545, 600), 12)
-    c.poly(p1 + p2[1:], (250, 165, 70), 0.95)
+def _tapered_bezier(c, p0, p1, p2, p3, w0, w1, color, alpha=1.0):
+    """Cubic bezier whose stroke width tapers from w0 to w1."""
+    approx = (math.hypot(p1[0] - p0[0], p1[1] - p0[1]) +
+              math.hypot(p2[0] - p1[0], p2[1] - p1[1]) +
+              math.hypot(p3[0] - p2[0], p3[1] - p2[1]))
+    steps = max(6, int(approx / 6) + 1)
+    for i in range(steps + 1):
+        t = i / steps
+        mt = 1.0 - t
+        x = (mt ** 3 * p0[0] + 3 * mt * mt * t * p1[0] +
+             3 * mt * t * t * p2[0] + t ** 3 * p3[0])
+        y = (mt ** 3 * p0[1] + 3 * mt * mt * t * p1[1] +
+             3 * mt * t * t * p2[1] + t ** 3 * p3[1])
+        c.disc(x, y, w0 + (w1 - w0) * t, color, alpha)
 
-    # -- koi head ---------------------------------------------------------
-    c.ellipse(665, 245, 66, 58, (240, 138, 29), 1.0, feather=2)
-    c.ellipse(700, 232, 34, 26, (255, 243, 214), 1.0)
-    # eye
-    c.circle(648, 222, 17, (255, 255, 255), 1.0)
-    c.circle(650, 224, 8, (20, 12, 6), 1.0)
-    c.circle(647, 220, 3, (255, 255, 255), 1.0)
+
+def _splash_behind(c):
+    # tall tapering broth plumes flanking the koi, breaking into spray
+    _tapered_bezier(c, (410, 805), (360, 720), (335, 655), (325, 595),
+                    11, 3, BROTH_LT, 0.90)
+    _tapered_bezier(c, (410, 805), (368, 725), (343, 663), (333, 605),
+                    5, 1.5, BROTH_HI, 0.70)
+    _tapered_bezier(c, (525, 805), (575, 720), (605, 660), (620, 600),
+                    10, 3, BROTH_LT, 0.90)
+    _tapered_bezier(c, (525, 805), (568, 725), (597, 668), (611, 610),
+                    4.5, 1.5, BROTH_HI, 0.70)
+    # spray droplets at the plume tips
+    for x, y, r in ((318, 585, 7), (330, 565, 5), (305, 600, 5),
+                    (628, 590, 7), (638, 570, 5), (612, 600, 5),
+                    (345, 640, 6), (605, 645, 6)):
+        c.disc(x, y, r, BROTH_LT, 0.85)
+        c.disc(x - r * 0.3, y - r * 0.3, r * 0.35, WHITE, 0.85)
+
+
+def _koi(c):
+    spine = [(452, 838), (428, 705), (442, 565),
+             (515, 425), (608, 322), (688, 252)]
+    pts = _catmull(spine, 22)
+    n = len(pts)
+    r_stops = [(0.0, 40), (0.18, 66), (0.42, 108),
+               (0.62, 104), (0.82, 86), (1.0, 70)]
+    col_stops = [(0.0, KOI_DEEP), (0.35, (232, 120, 16)),
+                 (0.7, KOI_MID), (1.0, (238, 132, 20))]
+
+    def frame(i):
+        """Spine point, tangent and belly-side perpendicular at index i."""
+        x, y = pts[i]
+        x0, y0 = pts[max(0, i - 1)]
+        x1, y1 = pts[min(n - 1, i + 1)]
+        tx, ty = x1 - x0, y1 - y0
+        L = math.hypot(tx, ty) or 1.0
+        tx, ty = tx / L, ty / L
+        # spine runs up-right; (-ty, tx) points right-down = belly side
+        return (x, y), (tx, ty), (-ty, tx)
+
+    # contact shadow where the koi exits the broth
+    c.soft_ellipse(465, 800, 95, 24, (90, 40, 6), 0.45)
+    # tail lobes, half-submerged in the broth
+    c.poly([(452, 838), (398, 872), (428, 896)], FIN, 0.55)
+    c.poly([(452, 838), (512, 876), (482, 900)], FIN, 0.55)
+    # body: dense discs along the spine, radius + color profiled
+    for i in range(n):
+        t = i / (n - 1)
+        (x, y), _, _ = frame(i)
+        c.disc(x, y, _profile(t, r_stops), _profile(t, col_stops), 1.0)
+    # cream belly as a narrower band on the lower-right side
+    for i in range(0, n, 2):
+        t = i / (n - 1)
+        (x, y), _, (px, py) = frame(i)
+        r = _profile(t, r_stops)
+        c.disc(x + px * 0.50 * r, y + py * 0.50 * r,
+               0.50 * r, mix(BELLY, KOI_GOLD, 0.18 * (1.0 - t)), 0.92)
+    # soft orange tint along the belly edge
+    for i in range(0, n, 2):
+        t = i / (n - 1)
+        (x, y), _, (px, py) = frame(i)
+        r = _profile(t, r_stops)
+        c.disc(x + px * 0.95 * r, y + py * 0.95 * r, 3.5, KOI_LT, 0.50)
+    # warm back highlight on the upper-left side
+    for i in range(0, n, 2):
+        t = i / (n - 1)
+        (x, y), _, (px, py) = frame(i)
+        r = _profile(t, r_stops)
+        c.disc(x - px * 0.45 * r, y - py * 0.45 * r,
+               0.42 * r, KOI_GOLD, 0.45)
+    # scale rows: small subtle arcs on the orange back half
+    for i in range(6, n - 8, 6):
+        t = i / (n - 1)
+        (x, y), _, (px, py) = frame(i)
+        r = _profile(t, r_stops)
+        c.ring(x - px * 0.45 * r, y - py * 0.45 * r,
+               0.10 * r + 3, 2.0, mix(KOI_DEEP, KOI_LT, 0.35), 0.38)
+    for i in range(9, n - 8, 6):
+        t = i / (n - 1)
+        (x, y), _, (px, py) = frame(i)
+        r = _profile(t, r_stops)
+        c.ring(x - px * 0.30 * r, y - py * 0.30 * r,
+               0.09 * r + 2.5, 1.8, mix(KOI_DEEP, KOI_GOLD, 0.55), 0.32)
+    # strong specular rim light along the back edge
+    for i in range(8, n - 6):
+        t = i / (n - 1)
+        (x, y), _, (px, py) = frame(i)
+        r = _profile(t, r_stops)
+        c.disc(x - px * 0.98 * r, y - py * 0.98 * r,
+               5.5, (255, 208, 128), 0.50)
+    # dorsal fin: low translucent ridge along the back, t 0.30..0.55
+    edge = []
+    ridge = []
+    for t in (0.30, 0.36, 0.42, 0.48, 0.55):
+        i = int(t * (n - 1))
+        (x, y), _, (px, py) = frame(i)
+        r = _profile(t, r_stops)
+        edge.append((x - px * 0.92 * r, y - py * 0.92 * r))
+        ridge.append((x - px * 1.08 * r, y - py * 1.08 * r))
+    c.poly([edge[0], ridge[1], ridge[2], ridge[3], edge[4]],
+           (226, 118, 16), 0.35)
+    for a, b in ((edge[0], ridge[1]), (edge[2], ridge[2]),
+                 (edge[3], ridge[3])):
+        c.line(a[0], a[1], b[0], b[1], 2.5, shade(FIN, 0.75), 0.4)
+    # pectoral fin on the belly side, t ~0.62 — a soft curved leaf
+    i = int(0.62 * (n - 1))
+    (bx, by), (tx, ty), (px, py) = frame(i)
+    base_top = (bx - tx * 30, by - ty * 30)
+    base_bot = (bx + tx * 42, by + ty * 42)
+    mid = (bx + px * 48 + tx * 6, by + py * 48 + ty * 6)
+    tip = (bx + px * 68 + tx * 12, by + py * 68 + ty * 12)
+    c.poly([base_top, mid, tip, base_bot], (232, 128, 20), 0.48)
+    c.disc(tip[0], tip[1], 6, (232, 128, 20), 0.48)
+    for f in (0.4, 0.7):
+        mx = base_top[0] + (base_bot[0] - base_top[0]) * f
+        my = base_top[1] + (base_bot[1] - base_top[1]) * f
+        c.line(mx, my, tip[0], tip[1], 2.0, shade(FIN, 0.75), 0.4)
+    # head, slightly tapered toward the snout
+    c.disc(688, 252, 68, KOI_MID)
+    c.disc(736, 240, 36, KOI_LT)
+    c.disc(662, 232, 26, KOI_GOLD, 0.50)
+    c.soft_ellipse(700, 285, 50, 26, (190, 90, 10), 0.40)
+    # eye: smaller, white, dark iris, pupil, sharp catchlight
+    c.disc(712, 222, 14, WHITE)
+    c.disc(715, 224, 8.5, (40, 20, 8))
+    c.disc(717, 225, 4.5, (10, 5, 2))
+    c.disc(708, 217, 4, WHITE, 0.95)
+    c.disc(721, 231, 2, WHITE, 0.70)
     # mouth + barbels
-    c.curve((700, 258), (712, 252), (720, 246), (726, 238), 5,
-            (122, 45, 8), 1.0)
-    c.curve((706, 254), (724, 268), (738, 286), (746, 306), 3,
-            (232, 163, 76), 1.0)
-    c.curve((700, 262), (712, 280), (720, 298), (724, 318), 3,
-            (232, 163, 76), 1.0)
+    c.bezier((742, 268), (758, 262), (772, 252), (780, 240),
+             5, (122, 42, 8), 0.90)
+    c.bezier((748, 262), (770, 285), (782, 305), (788, 325),
+             4, (214, 112, 16), 0.85)
+    c.bezier((738, 268), (752, 292), (758, 312), (760, 330),
+             4, (214, 112, 16), 0.85)
 
-    # -- broth splash ------------------------------------------------------
-    # foam crescents on the rim
-    c.ellipse(268, 742, 60, 16, (255, 217, 160), 0.95)
-    c.ellipse(756, 742, 60, 16, (255, 217, 160), 0.95)
-    c.ellipse(512, 726, 52, 15, (255, 217, 160), 0.9)
-    # splash plumes arcing up from the rim beside the koi: curved
-    # broth-orange crescents, cream tip droplets
-    s1 = c.bezier((290, 745), (255, 690), (258, 640), (285, 615), 12)
-    s2 = c.bezier((285, 615), (305, 650), (315, 700), (320, 745), 12)
-    c.poly(s1 + s2[1:], (224, 106, 31), 0.95)
-    s3 = c.bezier((734, 745), (769, 690), (766, 640), (739, 615), 12)
-    s4 = c.bezier((739, 615), (719, 650), (709, 700), (704, 745), 12)
-    c.poly(s3 + s4[1:], (224, 106, 31), 0.95)
-    c.droplet(285, 610, 8, (255, 217, 160))
-    c.droplet(739, 610, 8, (255, 217, 160))
-    # droplet arcs flying off the rim
-    for (x, y, r, col) in [
-            (232, 700, 14, (224, 106, 31)), (206, 660, 10, (193, 68, 14)),
-            (188, 614, 8, (224, 106, 31)), (792, 700, 14, (224, 106, 31)),
-            (818, 656, 10, (193, 68, 14)), (838, 610, 8, (224, 106, 31)),
-            (300, 668, 9, (255, 217, 160)), (724, 668, 9, (255, 217, 160)),
-            (262, 640, 7, (255, 217, 160)), (762, 640, 7, (255, 217, 160)),
-            (350, 700, 12, (224, 106, 31)), (674, 700, 12, (224, 106, 31))]:
-        c.droplet(x, y, r, col)
-    # droplets clinging to the koi
-    for (x, y, r) in [(560, 470, 7), (600, 420, 6), (520, 540, 8),
-                      (470, 620, 6), (640, 330, 7)]:
-        c.droplet(x, y, r, (255, 217, 160))
 
-    # -- flying chopsticks ---------------------------------------------------
-    c.line(150, 120, 330, 300, 14, (58, 36, 16), 1.0)
-    c.line(185, 95, 345, 275, 14, (58, 36, 16), 1.0)
-    c.line(300, 268, 330, 300, 15, (178, 40, 24), 1.0)
-    c.line(315, 243, 345, 275, 15, (178, 40, 24), 1.0)
-    c.line(120, 150, 190, 205, 4, (255, 255, 255), 0.45)
-    c.line(140, 110, 205, 165, 4, (255, 255, 255), 0.4)
-    c.line(165, 70, 225, 125, 4, (255, 255, 255), 0.35)
+def _splash_front(c):
+    # droplets with a soft shadow, a broth body and a highlight dot
+    drops = [
+        (330, 700, 7), (355, 655, 5), (300, 760, 6), (640, 690, 7),
+        (665, 640, 5), (700, 720, 6), (290, 830, 5), (730, 800, 6),
+        (410, 620, 4), (590, 600, 4), (350, 780, 5), (690, 770, 5),
+        (315, 725, 4), (675, 700, 4), (450, 600, 5), (545, 585, 4),
+    ]
+    for x, y, r in drops:
+        c.disc(x + r * 0.2, y + r * 0.3, r * 0.7, (120, 50, 8), 0.30)
+        c.disc(x, y, r, BROTH_LT, 0.90)
+        c.disc(x - r * 0.3, y - r * 0.3, r * 0.35, WHITE, 0.90)
+    # bright broth arcs curling off the exit point
+    c.bezier((420, 800), (400, 760), (395, 720), (400, 690),
+             6, BROTH_HI, 0.70)
+    c.bezier((520, 800), (540, 760), (545, 720), (540, 690),
+             6, BROTH_HI, 0.70)
 
-    # -- steam ---------------------------------------------------------------
-    # soft translucent curls: low alpha, discs compound so keep it faint
-    c.curve((400, 690), (380, 580), (410, 500), (388, 420), 20,
-            (255, 255, 255), 0.05)
-    c.curve((520, 680), (545, 570), (515, 490), (540, 410), 20,
-            (255, 255, 255), 0.05)
-    c.curve((640, 690), (665, 590), (640, 520), (662, 450), 18,
-            (255, 255, 255), 0.045)
 
-    # -- sparkles ---------------------------------------------------------------
-    c.sparkle(560, 380, 12)
-    c.sparkle(300, 760, 9)
-    c.sparkle(700, 180, 10)
-    c.sparkle(180, 560, 8)
+def _chopsticks(c):
+    # pair flying up-left, dark lacquer with red tips + motion streaks
+    c.line(138, 108, 318, 288, 13, (42, 22, 8))
+    c.line(278, 248, 318, 288, 13, (192, 24, 8))
+    c.line(150, 112, 300, 262, 3, (120, 70, 30), 0.70)
+    c.line(168, 92, 348, 272, 13, (42, 22, 8))
+    c.line(308, 232, 348, 272, 13, (192, 24, 8))
+    c.line(180, 96, 330, 246, 3, (120, 70, 30), 0.70)
+    c.line(120, 150, 180, 210, 3, WHITE, 0.30)
+    c.line(200, 80, 250, 130, 3, WHITE, 0.25)
+
+
+def _sparkles(c):
+    for x, y, r, a in ((700, 200, 12, 0.85), (185, 545, 10, 0.80),
+                       (355, 790, 9, 0.75), (560, 380, 8, 0.70),
+                       (95, 95, 8, 0.60), (880, 330, 8, 0.65),
+                       (640, 620, 7, 0.60), (260, 660, 7, 0.55)):
+        c.star4(x, y, r, WHITE, a)
+
+
+def render_scene():
+    """Compose the full 1024x1024 scene and return PNG bytes."""
+    c = Canvas()
+    _background(c)
+    _table(c)
+    _bowl(c)
+    _broth(c)
+    _steam(c)
+    _splash_behind(c)
+    _koi(c)
+    _splash_front(c)
+    _chopsticks(c)
+    _sparkles(c)
+    c.vignette(0.24)
+    return c.to_png_bytes()
